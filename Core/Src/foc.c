@@ -5,7 +5,16 @@
 #define FOC_TWO_PI                (2.0f * PI)
 #define FOC_ENCODER_CPR           4096
 #define FOC_DIRECTION_TEST_ANGLE  (0.5f * PI)
-#define FOC_DIRECTION_MIN_DELTA   2
+#define FOC_ALIGNMENT_SAMPLE_COUNT 8U
+#define FOC_ALIGNMENT_SAMPLE_DELAY_MS 1U
+#define FOC_ALIGNMENT_VOLTAGE_PU   0.15f
+#define FOC_ALIGNMENT_RAMP_UP_MS   200U
+#define FOC_ALIGNMENT_ANGLE_RAMP_MS 400U
+#define FOC_ALIGNMENT_SETTLE_MS    100U
+#define FOC_ALIGNMENT_RAMP_DOWN_MS 100U
+#define FOC_ALIGNMENT_RAMP_STEP_MS 2U
+#define FOC_DIRECTION_MIN_RATIO   0.25f
+#define FOC_DIRECTION_MAX_RATIO   1.75f
 #define DRV8323_WAKE_DELAY_MS     1U
 #define DRV8323_RESET_DELAY_MS    1U
 
@@ -200,6 +209,41 @@ static float32_t wrap_angle_2pi(float32_t angle) {
     return angle;
 }
 
+static HAL_StatusTypeDef read_encoder_average(
+    FOC_HandleTypeDef *self,
+    float32_t *average_raw_angle) {
+    if (self == NULL || self->as5600_handle == NULL || average_raw_angle == NULL) {
+        return HAL_ERROR;
+    }
+
+    uint16_t reference_raw_angle;
+    if (as5600_read(self->as5600_handle, &reference_raw_angle) != HAL_OK) {
+        return HAL_ERROR;
+    }
+
+    int32_t sample_sum = (int32_t)reference_raw_angle;
+    for (uint32_t sample = 1U; sample < FOC_ALIGNMENT_SAMPLE_COUNT; ++sample) {
+        HAL_Delay(FOC_ALIGNMENT_SAMPLE_DELAY_MS);
+
+        uint16_t raw_angle;
+        if (as5600_read(self->as5600_handle, &raw_angle) != HAL_OK) {
+            return HAL_ERROR;
+        }
+
+        int32_t sample_delta = (int32_t)raw_angle - (int32_t)reference_raw_angle;
+        if (sample_delta > FOC_ENCODER_CPR / 2) {
+            sample_delta -= FOC_ENCODER_CPR;
+        } else if (sample_delta < -(FOC_ENCODER_CPR / 2)) {
+            sample_delta += FOC_ENCODER_CPR;
+        }
+        sample_sum += (int32_t)reference_raw_angle + sample_delta;
+    }
+
+    *average_raw_angle =
+        (float32_t)sample_sum / (float32_t)FOC_ALIGNMENT_SAMPLE_COUNT;
+    return HAL_OK;
+}
+
 static HAL_StatusTypeDef apply_alignment_vector(
     FOC_HandleTypeDef *self,
     float32_t voltage,
@@ -214,16 +258,63 @@ static HAL_StatusTypeDef apply_alignment_vector(
     return pwm_update_duty(self->htim, duty_a, duty_b, duty_c);
 }
 
+static HAL_StatusTypeDef transition_alignment_vector(
+    FOC_HandleTypeDef *self,
+    float32_t start_voltage,
+    float32_t end_voltage,
+    float32_t start_angle,
+    float32_t end_angle,
+    uint32_t duration_ms) {
+    if (self == NULL || duration_ms == 0U) {
+        return HAL_ERROR;
+    }
+
+    uint32_t step_count = duration_ms / FOC_ALIGNMENT_RAMP_STEP_MS;
+    if (step_count == 0U) {
+        step_count = 1U;
+    }
+
+    if (driver_fault_active(self)) {
+        return HAL_ERROR;
+    }
+
+    for (uint32_t step = 1U; step <= step_count; ++step) {
+        const float32_t progress = (float32_t)step / (float32_t)step_count;
+        const float32_t smooth_progress =
+            progress * progress * (3.0f - 2.0f * progress);
+        const float32_t voltage =
+            start_voltage + (end_voltage - start_voltage) * smooth_progress;
+        const float32_t angle =
+            start_angle + (end_angle - start_angle) * smooth_progress;
+
+        if (apply_alignment_vector(self, voltage, angle) != HAL_OK) {
+            return HAL_ERROR;
+        }
+        HAL_Delay(FOC_ALIGNMENT_RAMP_STEP_MS);
+        if (driver_fault_active(self)) {
+            return HAL_ERROR;
+        }
+    }
+
+    return HAL_OK;
+}
+
 static HAL_StatusTypeDef rotor_align(
     FOC_HandleTypeDef *self,
     float32_t alignment_voltage_pu,
     uint32_t alignment_time_ms) {
-    uint16_t initial_raw_angle;
-    uint16_t probe_raw_angle;
-    uint16_t aligned_raw_angle;
+    float32_t initial_raw_angle;
+    float32_t probe_raw_angle;
+    float32_t aligned_raw_angle;
 
     self->state = FOC_STATE_ALIGNING;
-    if (apply_alignment_vector(self, alignment_voltage_pu, 0.0f) != HAL_OK) {
+    if (transition_alignment_vector(
+            self,
+            0.0f,
+            alignment_voltage_pu,
+            0.0f,
+            0.0f,
+            FOC_ALIGNMENT_RAMP_UP_MS) != HAL_OK) {
         return HAL_ERROR;
     }
 
@@ -231,53 +322,77 @@ static HAL_StatusTypeDef rotor_align(
     if (driver_fault_active(self)) {
         return HAL_ERROR;
     }
-    if (as5600_read(self->as5600_handle, &initial_raw_angle) != HAL_OK) {
+    if (read_encoder_average(self, &initial_raw_angle) != HAL_OK) {
         return HAL_ERROR;
     }
 
-    if (apply_alignment_vector(
+    if (transition_alignment_vector(
             self,
             alignment_voltage_pu,
-            FOC_DIRECTION_TEST_ANGLE) != HAL_OK) {
+            alignment_voltage_pu,
+            0.0f,
+            FOC_DIRECTION_TEST_ANGLE,
+            FOC_ALIGNMENT_ANGLE_RAMP_MS) != HAL_OK) {
         return HAL_ERROR;
     }
     HAL_Delay(alignment_time_ms);
     if (driver_fault_active(self) ||
-        as5600_read(self->as5600_handle, &probe_raw_angle) != HAL_OK) {
+        read_encoder_average(self, &probe_raw_angle) != HAL_OK) {
         return HAL_ERROR;
     }
 
-    int32_t encoder_delta = (int32_t)probe_raw_angle - (int32_t)initial_raw_angle;
-    if (encoder_delta > FOC_ENCODER_CPR / 2) {
-        encoder_delta -= FOC_ENCODER_CPR;
-    } else if (encoder_delta < -(FOC_ENCODER_CPR / 2)) {
-        encoder_delta += FOC_ENCODER_CPR;
+    float32_t encoder_delta = probe_raw_angle - initial_raw_angle;
+    if (encoder_delta > (float32_t)FOC_ENCODER_CPR / 2.0f) {
+        encoder_delta -= (float32_t)FOC_ENCODER_CPR;
+    } else if (encoder_delta < -(float32_t)FOC_ENCODER_CPR / 2.0f) {
+        encoder_delta += (float32_t)FOC_ENCODER_CPR;
     }
-    if (encoder_delta >= -FOC_DIRECTION_MIN_DELTA &&
-        encoder_delta <= FOC_DIRECTION_MIN_DELTA) {
+
+    const float32_t expected_encoder_delta =
+        (float32_t)FOC_ENCODER_CPR * FOC_DIRECTION_TEST_ANGLE /
+        (FOC_TWO_PI * (float32_t)self->pole_pairs);
+    const float32_t absolute_encoder_delta = fabsf(encoder_delta);
+    if (absolute_encoder_delta < expected_encoder_delta * FOC_DIRECTION_MIN_RATIO ||
+        absolute_encoder_delta > expected_encoder_delta * FOC_DIRECTION_MAX_RATIO) {
         return HAL_ERROR;
     }
     self->rotor_direction = encoder_delta > 0
         ? FOC_ROTOR_DIRECTION_SAME
         : FOC_ROTOR_DIRECTION_OPPOSITE;
 
-    if (apply_alignment_vector(self, alignment_voltage_pu, 0.0f) != HAL_OK) {
+    if (transition_alignment_vector(
+            self,
+            alignment_voltage_pu,
+            alignment_voltage_pu,
+            FOC_DIRECTION_TEST_ANGLE,
+            0.0f,
+            FOC_ALIGNMENT_ANGLE_RAMP_MS) != HAL_OK) {
         return HAL_ERROR;
     }
     HAL_Delay(alignment_time_ms);
     if (driver_fault_active(self) ||
-        as5600_read(self->as5600_handle, &aligned_raw_angle) != HAL_OK) {
+        read_encoder_average(self, &aligned_raw_angle) != HAL_OK) {
         return HAL_ERROR;
     }
 
     const float32_t mechanical_angle =
-        (float32_t)aligned_raw_angle * FOC_TWO_PI / (float32_t)FOC_ENCODER_CPR;
+        aligned_raw_angle * FOC_TWO_PI / (float32_t)FOC_ENCODER_CPR;
     const float32_t direction_sign =
         self->rotor_direction == FOC_ROTOR_DIRECTION_SAME ? 1.0f : -1.0f;
     self->rotor_offset = wrap_angle_2pi(
         -(direction_sign * (float32_t)self->pole_pairs * mechanical_angle));
     self->Target_Ud = 0.0f;
     self->Target_Uq = 0.0f;
+
+    if (transition_alignment_vector(
+            self,
+            alignment_voltage_pu,
+            0.0f,
+            0.0f,
+            0.0f,
+            FOC_ALIGNMENT_RAMP_DOWN_MS) != HAL_OK) {
+        return HAL_ERROR;
+    }
 
     return pwm_update_duty(self->htim, 0.5f, 0.5f, 0.5f);
 }
@@ -364,22 +479,30 @@ HAL_StatusTypeDef FOCInitialize(
         return HAL_ERROR;
     }
 
-    if (driver_enable(self) != HAL_OK) {
+    status = driver_enable(self);
+    if (status != HAL_OK) {
         return status;
     }
 
-    status = rotor_align(self, 0.5f, 5.0f);
+    status = rotor_align(
+        self,
+        FOC_ALIGNMENT_VOLTAGE_PU,
+        FOC_ALIGNMENT_SETTLE_MS);
     if (status != HAL_OK) {
         driver_shutdown(self, FOC_STATE_FAULT);
         return status;
     }
 
-    driver_shutdown(self, FOC_STATE_FAULT);
+    driver_shutdown(self, FOC_STATE_DISABLED);
     return HAL_OK;
 }
 
 HAL_StatusTypeDef FOC_Start(
     FOC_HandleTypeDef *self) {
+
+    if (self == NULL || self->state != FOC_STATE_DISABLED) {
+        return HAL_ERROR;
+    }
 
     HAL_StatusTypeDef status = driver_enable(self);
     if (status != HAL_OK) {
