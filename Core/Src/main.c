@@ -54,6 +54,8 @@ UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 FOC_HandleTypeDef foc;
+
+uint8_t foc_update_pending;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -117,6 +119,7 @@ int main(void)
   }
   FOC_SetTarget(&foc, 0.2f, 0.0f);
   FOC_Start(&foc);
+  HAL_TIM_Base_Start_IT(&htim1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -126,7 +129,10 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    FOC_Update(&foc);
+    if (foc_update_pending) {
+      FOC_Update(&foc);
+      foc_update_pending = 0U;
+    }
   }
   /* USER CODE END 3 */
 }
@@ -351,8 +357,6 @@ static void MX_ADC3_Init(void)
   hadc3.Init.ScanConvMode = DISABLE;
   hadc3.Init.ContinuousConvMode = DISABLE;
   hadc3.Init.DiscontinuousConvMode = DISABLE;
-  hadc3.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
-  hadc3.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc3.Init.DataAlign = ADC_DATAALIGN_RIGHT;
   hadc3.Init.NbrOfConversion = 1;
   hadc3.Init.DMAContinuousRequests = DISABLE;
@@ -605,6 +609,13 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc) {
   uint32_t raw_current_v = HAL_ADCEx_InjectedGetValue(&hadc2, ADC_INJECTED_RANK_1);
   uint32_t raw_current_w = HAL_ADCEx_InjectedGetValue(&hadc3, ADC_INJECTED_RANK_1);
   (void)FOC_CurrentSample(&foc, raw_current_u, raw_current_v, raw_current_w);
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+  if (htim == NULL || htim->Instance != TIM1) {
+    return;
+  }
+  foc_update_pending = 1U;
 }
 /* USER CODE END 4 */
 
