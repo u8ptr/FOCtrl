@@ -21,6 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <math.h>
 #include <stdio.h>
 #include "as5600.h"
 #include "foc.h"
@@ -34,6 +35,12 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define MOTOR_POLE_PAIRS 7
+#define CURRENT_LOOP_IQ_REFERENCE_A 0.2f
+#define CURRENT_LOOP_ID_REFERENCE_A 0.0f
+#define CURRENT_LOOP_Q_KP 0.05f
+#define CURRENT_LOOP_Q_KI 0.000f
+#define CURRENT_LOOP_D_KP 0.05f
+#define CURRENT_LOOP_D_KI 0.000f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -55,7 +62,14 @@ UART_HandleTypeDef huart1;
 /* USER CODE BEGIN PV */
 FOC_HandleTypeDef foc;
 
-uint8_t foc_update_pending;
+volatile uint8_t foc_update_pending;
+
+static arm_pid_instance_f32 current_q_pi;
+static arm_pid_instance_f32 current_d_pi;
+static uint8_t current_loop_initialized;
+
+volatile float32_t current_loop_uq;
+volatile float32_t current_loop_ud;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -68,11 +82,84 @@ static void MX_ADC1_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_ADC3_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void CurrentLoop_Init(void);
+static void CurrentLoop_Reset(void);
+static void CurrentLoop_Run(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void CurrentLoop_Init(void) {
+  current_q_pi.Kp = CURRENT_LOOP_Q_KP;
+  current_q_pi.Ki = CURRENT_LOOP_Q_KI;
+  current_q_pi.Kd = 0.0f;
+  arm_pid_init_f32(&current_q_pi, 1);
+
+  current_d_pi.Kp = CURRENT_LOOP_D_KP;
+  current_d_pi.Ki = CURRENT_LOOP_D_KI;
+  current_d_pi.Kd = 0.0f;
+  arm_pid_init_f32(&current_d_pi, 1);
+
+  current_loop_uq = 0.0f;
+  current_loop_ud = 0.0f;
+  current_loop_initialized = 1U;
+}
+
+static void CurrentLoop_Reset(void) {
+  if (current_loop_initialized == 0U) {
+    return;
+  }
+
+  arm_pid_reset_f32(&current_q_pi);
+  arm_pid_reset_f32(&current_d_pi);
+  current_loop_uq = 0.0f;
+  current_loop_ud = 0.0f;
+  (void)FOC_SetTarget(&foc, 0.0f, 0.0f);
+}
+
+static void CurrentLoop_Run(void) {
+  if (current_loop_initialized == 0U) {
+    return;
+  }
+  if (foc.state != FOC_STATE_RUNNING) {
+    CurrentLoop_Reset();
+    return;
+  }
+
+  const float32_t q_error = CURRENT_LOOP_IQ_REFERENCE_A - foc.I_q;
+  const float32_t d_error = CURRENT_LOOP_ID_REFERENCE_A - foc.I_d;
+  float32_t uq = arm_pid_f32(&current_q_pi, q_error);
+  float32_t ud = arm_pid_f32(&current_d_pi, d_error);
+
+  if (!isfinite(uq) || !isfinite(ud)) {
+    CurrentLoop_Reset();
+    return;
+  }
+
+  const float32_t voltage_limit = 0.577350269f * FOC_VOLTAGE_MARGIN;
+  const float32_t voltage_magnitude_squared = uq * uq + ud * ud;
+  if (voltage_magnitude_squared > voltage_limit * voltage_limit) {
+    float32_t voltage_magnitude;
+    if (arm_sqrt_f32(voltage_magnitude_squared, &voltage_magnitude) !=
+          ARM_MATH_SUCCESS ||
+        voltage_magnitude <= 0.0f) {
+      CurrentLoop_Reset();
+      return;
+    }
+
+    const float32_t scale = voltage_limit / voltage_magnitude;
+    uq *= scale;
+    ud *= scale;
+  }
+
+  /* arm_pid_f32 is an incremental controller. Feed the limited command back
+   * into its output state so the integrator cannot continue winding up. */
+  current_q_pi.state[2] = uq;
+  current_d_pi.state[2] = ud;
+  current_loop_uq = uq;
+  current_loop_ud = ud;
+  (void)FOC_SetTarget(&foc, uq, ud);
+}
 
 /* USER CODE END 0 */
 
@@ -117,7 +204,8 @@ int main(void)
     printf("Foc Initialize Failed \r\n");
     Error_Handler();
   }
-  FOC_SetTarget(&foc, 0.2f, 0.0f);
+  CurrentLoop_Init();
+  FOC_SetTarget(&foc, 0.0f, 0.0f);
   FOC_Start(&foc);
   HAL_TIM_Base_Start_IT(&htim1);
   /* USER CODE END 2 */
@@ -608,7 +696,11 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc) {
   uint32_t raw_current_u = HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_1);
   uint32_t raw_current_v = HAL_ADCEx_InjectedGetValue(&hadc2, ADC_INJECTED_RANK_1);
   uint32_t raw_current_w = HAL_ADCEx_InjectedGetValue(&hadc3, ADC_INJECTED_RANK_1);
-  (void)FOC_CurrentSample(&foc, raw_current_u, raw_current_v, raw_current_w);
+  if (FOC_CurrentSample(&foc, raw_current_u, raw_current_v, raw_current_w) == HAL_OK) {
+    CurrentLoop_Run();
+  } else {
+    CurrentLoop_Reset();
+  }
 }
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
