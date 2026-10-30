@@ -36,11 +36,15 @@ typedef struct {
     uint8_t pole_pairs;
     float32_t rotor_offset;
     uint8_t rotor_direction;
+    float32_t electrical_angle;
     uint8_t pwm_started;
     volatile FOC_StateTypeDef state;
 
     float32_t Target_Uq;
     float32_t Target_Ud;
+
+    float32_t I_q;
+    float32_t I_d;
 
     float32_t current_u;
     float32_t current_v;
@@ -48,6 +52,7 @@ typedef struct {
     float32_t current_offset_u;
     float32_t current_offset_v;
     float32_t current_offset_w;
+
     uint64_t adc_calibration_sum_u;
     uint64_t adc_calibration_sum_v;
     uint64_t adc_calibration_sum_w;
@@ -83,5 +88,6 @@ void inv_park(float32_t arc_angle, float32_t U_q, float32_t U_d, float32_t *U_al
 void inv_clarke(float32_t U_alpha, float32_t U_beta, float32_t *U_a, float32_t *U_b,
               float32_t *U_c);
 void svpwm(float32_t U_alpha, float32_t U_beta, float32_t *duty_a, float32_t *duty_b, float32_t *duty_c);
+void clarke(float32_t I_u, float32_t I_v, float32_t I_w, float32_t *I_a, float32_t *I_b);
 
 #endif //FOCTRL_FOC_H

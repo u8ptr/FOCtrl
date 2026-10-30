@@ -450,6 +450,19 @@ void inv_park(float32_t arc_angle, float32_t U_q, float32_t U_d, float32_t *U_al
     *U_beta = U_d * sin + U_q * cos;
 }
 
+void clarke(float32_t I_u, float32_t I_v, float32_t I_w, float32_t *I_a, float32_t *I_b) {
+    *I_a = I_u;
+    *I_b = (I_v - I_w) * 0.577350269f;
+}
+
+void park(float32_t arc_angle, float32_t I_a, float32_t I_b, float32_t *I_q, float32_t *I_d) {
+    float32_t cos = arm_cos_f32(arc_angle);
+    float32_t sin = arm_sin_f32(arc_angle);
+
+    *I_d = cos * I_a + sin * I_b;
+    *I_q = -1.0f * sin * I_a + cos * I_b;
+}
+
 void svpwm(float32_t U_alpha, float32_t U_beta, float32_t *duty_a, float32_t *duty_b, float32_t *duty_c) {
     float32_t U_a, U_b, U_c;
     inv_clarke(U_alpha, U_beta, &U_a, &U_b, &U_c);
@@ -507,9 +520,12 @@ HAL_StatusTypeDef FOCInitialize(
     self->pole_pairs = pole_pairs;
     self->rotor_direction = FOC_ROTOR_DIRECTION_SAME;
     self->rotor_offset = 0.0f;
+    self->electrical_angle = 0.0f;
     self->pwm_started = 0U;
     self->Target_Uq = 0.0f;
     self->Target_Ud = 0.0f;
+    self->I_q = 0.0f;
+    self->I_d = 0.0f;
     self->state = FOC_STATE_UNINITIALIZED;
     self->current_u = 0.0f;
     self->current_v = 0.0f;
@@ -659,6 +675,7 @@ HAL_StatusTypeDef FOC_Update(FOC_HandleTypeDef *self) {
         self->rotor_direction == FOC_ROTOR_DIRECTION_SAME ? 1.0f : -1.0f;
     float32_t electrical_angle =
         direction_sign * (float32_t)self->pole_pairs * magnitude_angle + self->rotor_offset;
+    self->electrical_angle = electrical_angle;
     if (limit_dq_voltage(&Target_Uq, &Target_Ud) != HAL_OK) {
         driver_shutdown(self, FOC_STATE_FAULT);
         return HAL_ERROR;
@@ -752,5 +769,9 @@ HAL_StatusTypeDef FOC_CurrentSample(
     self->current_u = measured_current_u - common_mode_current;
     self->current_v = measured_current_v - common_mode_current;
     self->current_w = measured_current_w - common_mode_current;
+
+    float32_t I_a, I_b;
+    clarke(self->current_u, self->current_v, self->current_w, &I_a, &I_b);
+    park(self->electrical_angle, I_a, I_b, &self->I_q, &self->I_d);
     return HAL_OK;
 }
