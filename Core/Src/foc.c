@@ -1,6 +1,7 @@
 #include "foc.h"
 
 #include <math.h>
+#include <sys/stat.h>
 
 #define FOC_TWO_PI                (2.0f * PI)
 #define FOC_ENCODER_CPR           4096
@@ -15,6 +16,10 @@
 #define FOC_ALIGNMENT_RAMP_STEP_MS 2U
 #define FOC_DIRECTION_MIN_RATIO   0.25f
 #define FOC_DIRECTION_MAX_RATIO   1.75f
+#define FOC_ADC_MAX_VALUE         4095U
+#define FOC_ADC_CALIBRATION_DISCARD_COUNT 32U
+#define FOC_ADC_CALIBRATION_SAMPLE_COUNT 1024U
+#define FOC_ADC_CALIBRATION_TIMEOUT_MS 200U
 #define DRV8323_WAKE_DELAY_MS     1U
 #define DRV8323_RESET_DELAY_MS    1U
 
@@ -180,22 +185,39 @@ static void driver_shutdown(FOC_HandleTypeDef *self, FOC_StateTypeDef next_state
     pwm_stop_all(self);
     self->Target_Ud = 0.0f;
     self->Target_Uq = 0.0f;
+    self->current_u = 0.0f;
+    self->current_v = 0.0f;
+    self->current_w = 0.0f;
     self->state = next_state;
 }
 
-static HAL_StatusTypeDef driver_enable(FOC_HandleTypeDef *self) {
-    HAL_StatusTypeDef status = pwm_start_all(self);
-    if (status != HAL_OK) {
-        driver_shutdown(self, FOC_STATE_FAULT);
-        return status;
+static HAL_StatusTypeDef driver_wake(FOC_HandleTypeDef *self) {
+    if (self == NULL || self->driver_enable_port == NULL ||
+        self->driver_enable_pin == 0U) {
+        return HAL_ERROR;
     }
 
     HAL_GPIO_WritePin(self->driver_enable_port, self->driver_enable_pin, GPIO_PIN_SET);
     HAL_Delay(DRV8323_WAKE_DELAY_MS);
 
     if (driver_fault_active(self)) {
-        driver_shutdown(self, FOC_STATE_FAULT);
         return HAL_ERROR;
+    }
+
+    return HAL_OK;
+}
+
+static HAL_StatusTypeDef driver_enable(FOC_HandleTypeDef *self) {
+    HAL_StatusTypeDef status = driver_wake(self);
+    if (status != HAL_OK) {
+        driver_shutdown(self, FOC_STATE_FAULT);
+        return status;
+    }
+
+    status = pwm_start_all(self);
+    if (status != HAL_OK) {
+        driver_shutdown(self, FOC_STATE_FAULT);
+        return status;
     }
 
     return HAL_OK;
@@ -296,6 +318,22 @@ static HAL_StatusTypeDef transition_alignment_vector(
         }
     }
 
+    return HAL_OK;
+}
+
+static HAL_StatusTypeDef adc_enable(FOC_HandleTypeDef *self) {
+    if (
+        HAL_ADCEx_InjectedStart(self->hadc2) != HAL_OK ||
+        HAL_ADCEx_InjectedStart(self->hadc3) != HAL_OK ||
+        HAL_ADCEx_InjectedStart_IT(self->hadc1) != HAL_OK) {
+        return HAL_ERROR;
+    }
+    if (HAL_TIM_PWM_Start(self->htim, TIM_CHANNEL_4) != HAL_OK) {
+        return HAL_ERROR;
+    }
+    /* Starting a channel on an advanced timer enables MOE globally. Keep the
+     * three phase outputs disabled until pwm_start_all() is called. */
+    __HAL_TIM_MOE_DISABLE(self->htim);
     return HAL_OK;
 }
 
@@ -441,12 +479,16 @@ HAL_StatusTypeDef FOCInitialize(
     FOC_HandleTypeDef *self,
     TIM_HandleTypeDef *htim,
     I2C_HandleTypeDef *as5600_handle,
+    ADC_HandleTypeDef *hadc1,
+    ADC_HandleTypeDef *hadc2,
+    ADC_HandleTypeDef *hadc3,
     uint8_t pole_pairs,
     GPIO_TypeDef *driver_enable_port,
     uint16_t driver_enable_pin,
     GPIO_TypeDef *driver_fault_port,
     uint16_t driver_fault_pin) {
     if (self == NULL || htim == NULL || htim->Instance == NULL ||
+        hadc1 == NULL || hadc2 == NULL || hadc3 == NULL ||
         as5600_handle == NULL || pole_pairs == 0U ||
         driver_enable_port == NULL || driver_enable_pin == 0U ||
         driver_fault_port == NULL || driver_fault_pin == 0U) {
@@ -455,6 +497,9 @@ HAL_StatusTypeDef FOCInitialize(
 
     self->htim = htim;
     self->as5600_handle = as5600_handle;
+    self->hadc1 = hadc1;
+    self->hadc2 = hadc2;
+    self->hadc3 = hadc3;
     self->driver_enable_port = driver_enable_port;
     self->driver_enable_pin = driver_enable_pin;
     self->driver_fault_port = driver_fault_port;
@@ -466,6 +511,16 @@ HAL_StatusTypeDef FOCInitialize(
     self->Target_Uq = 0.0f;
     self->Target_Ud = 0.0f;
     self->state = FOC_STATE_UNINITIALIZED;
+    self->current_u = 0.0f;
+    self->current_v = 0.0f;
+    self->current_w = 0.0f;
+    self->current_offset_u = 0.0f;
+    self->current_offset_v = 0.0f;
+    self->current_offset_w = 0.0f;
+    self->adc_calibration_sum_u = 0U;
+    self->adc_calibration_sum_v = 0U;
+    self->adc_calibration_sum_w = 0U;
+    self->adc_calibration_count = 0U;
 
     HAL_GPIO_WritePin(self->driver_enable_port, self->driver_enable_pin, GPIO_PIN_RESET);
     __HAL_TIM_MOE_DISABLE(self->htim);
@@ -475,7 +530,33 @@ HAL_StatusTypeDef FOCInitialize(
         return status;
     }
 
-    if (pwm_update_duty(self->htim, 0.5f, 0.5f, 0.5f) != HAL_OK) {
+    if (pwm_update_duty(self->htim, 0.0f, 0.0f, 0.0f) != HAL_OK) {
+        return HAL_ERROR;
+    }
+
+    status = driver_wake(self);
+    if (status != HAL_OK) {
+        driver_shutdown(self, FOC_STATE_FAULT);
+        return status;
+    }
+
+    self->state = FOC_STATE_CALIBRATING;
+    status = adc_enable(self);
+    if (status != HAL_OK) {
+        driver_shutdown(self, FOC_STATE_FAULT);
+        return status;
+    }
+
+    const uint32_t calibration_start_tick = HAL_GetTick();
+    while (self->state == FOC_STATE_CALIBRATING) {
+        if ((HAL_GetTick() - calibration_start_tick) >=
+            FOC_ADC_CALIBRATION_TIMEOUT_MS) {
+            driver_shutdown(self, FOC_STATE_FAULT);
+            return HAL_TIMEOUT;
+        }
+    }
+    if (self->state != FOC_STATE_ALIGNING) {
+        driver_shutdown(self, FOC_STATE_FAULT);
         return HAL_ERROR;
     }
 
@@ -588,5 +669,88 @@ HAL_StatusTypeDef FOC_Update(FOC_HandleTypeDef *self) {
         driver_shutdown(self, FOC_STATE_FAULT);
         return HAL_ERROR;
     }
+    return HAL_OK;
+}
+
+static HAL_StatusTypeDef FOC_AdcCalibrate(
+    FOC_HandleTypeDef *self,
+    uint32_t raw_u,
+    uint32_t raw_v,
+    uint32_t raw_w) {
+    if (self == NULL || self->state != FOC_STATE_CALIBRATING ||
+        raw_u > FOC_ADC_MAX_VALUE || raw_v > FOC_ADC_MAX_VALUE ||
+        raw_w > FOC_ADC_MAX_VALUE) {
+        if (self != NULL) {
+            self->state = FOC_STATE_FAULT;
+        }
+        return HAL_ERROR;
+    }
+
+    if (self->adc_calibration_count < FOC_ADC_CALIBRATION_DISCARD_COUNT) {
+        ++self->adc_calibration_count;
+        return HAL_OK;
+    }
+
+    self->adc_calibration_sum_u += raw_u;
+    self->adc_calibration_sum_v += raw_v;
+    self->adc_calibration_sum_w += raw_w;
+    ++self->adc_calibration_count;
+
+    const uint32_t valid_sample_count =
+        self->adc_calibration_count - FOC_ADC_CALIBRATION_DISCARD_COUNT;
+    if (valid_sample_count < FOC_ADC_CALIBRATION_SAMPLE_COUNT) {
+        return HAL_OK;
+    }
+
+    self->current_offset_u =
+        (float32_t)self->adc_calibration_sum_u /
+        (float32_t)FOC_ADC_CALIBRATION_SAMPLE_COUNT;
+    self->current_offset_v =
+        (float32_t)self->adc_calibration_sum_v /
+        (float32_t)FOC_ADC_CALIBRATION_SAMPLE_COUNT;
+    self->current_offset_w =
+        (float32_t)self->adc_calibration_sum_w /
+        (float32_t)FOC_ADC_CALIBRATION_SAMPLE_COUNT;
+    self->current_u = 0.0f;
+    self->current_v = 0.0f;
+    self->current_w = 0.0f;
+    self->state = FOC_STATE_ALIGNING;
+
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef FOC_CurrentSample(
+    FOC_HandleTypeDef *self,
+    uint32_t raw_u,
+    uint32_t raw_v,
+    uint32_t raw_w) {
+    if (self == NULL) {
+        return HAL_ERROR;
+    }
+    if (self->state == FOC_STATE_CALIBRATING) {
+        return FOC_AdcCalibrate(self, raw_u, raw_v, raw_w);
+    }
+    if (self->state != FOC_STATE_ALIGNING &&
+        self->state != FOC_STATE_RUNNING) {
+        self->current_u = 0.0f;
+        self->current_v = 0.0f;
+        self->current_w = 0.0f;
+        return HAL_OK;
+    }
+    const float32_t current_scale =
+        3.3f /
+        (4095.0f * FOC_CURRENT_SAMPLE_RESISTER * FOC_CURRENT_SAMPLE_GAIN);
+    const float32_t measured_current_u =
+        ((float32_t)raw_u - self->current_offset_u) * current_scale;
+    const float32_t measured_current_v =
+        ((float32_t)raw_v - self->current_offset_v) * current_scale;
+    const float32_t measured_current_w =
+        ((float32_t)raw_w - self->current_offset_w) * current_scale;
+    const float32_t common_mode_current =
+        (measured_current_u + measured_current_v + measured_current_w) / 3.0f;
+
+    self->current_u = measured_current_u - common_mode_current;
+    self->current_v = measured_current_v - common_mode_current;
+    self->current_w = measured_current_w - common_mode_current;
     return HAL_OK;
 }
