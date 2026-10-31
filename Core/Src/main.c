@@ -37,10 +37,10 @@
 #define MOTOR_POLE_PAIRS 7
 #define CURRENT_LOOP_IQ_REFERENCE_A 0.2f
 #define CURRENT_LOOP_ID_REFERENCE_A 0.0f
-#define CURRENT_LOOP_Q_KP 0.05f
-#define CURRENT_LOOP_Q_KI 0.000f
-#define CURRENT_LOOP_D_KP 0.05f
-#define CURRENT_LOOP_D_KI 0.000f
+#define CURRENT_LOOP_Q_KP 0.15f
+#define CURRENT_LOOP_Q_KI 0.003f
+#define CURRENT_LOOP_D_KP 0.15f
+#define CURRENT_LOOP_D_KI 0.003f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
