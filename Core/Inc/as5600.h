@@ -1,6 +1,8 @@
 #ifndef FOCTRL_AS5600_H
 #define FOCTRL_AS5600_H
 
+#include "arm_math_types.h"
+#include "dsp/fast_math_functions.h"
 #include "stm32f4xx_hal.h"
 
 #define AS5600_ADDR             (0x36U << 1)
@@ -13,6 +15,10 @@
 
 
 HAL_StatusTypeDef as5600_init(I2C_HandleTypeDef *hi2c);
-HAL_StatusTypeDef as5600_read(I2C_HandleTypeDef *hi2c, uint16_t *raw_angle);
+HAL_StatusTypeDef as5600_read_blocking(
+    I2C_HandleTypeDef *hi2c,
+    uint16_t *raw_angle);
+HAL_StatusTypeDef as5600_trigger(I2C_HandleTypeDef *hi2c);
+HAL_StatusTypeDef as5600_callback(float32_t *magnitude_angle);
 
 #endif //FOCTRL_AS5600_H

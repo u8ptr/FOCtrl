@@ -239,7 +239,9 @@ static HAL_StatusTypeDef read_encoder_average(
     }
 
     uint16_t reference_raw_angle;
-    if (as5600_read(self->as5600_handle, &reference_raw_angle) != HAL_OK) {
+    if (as5600_read_blocking(
+            self->as5600_handle,
+            &reference_raw_angle) != HAL_OK) {
         return HAL_ERROR;
     }
 
@@ -248,7 +250,7 @@ static HAL_StatusTypeDef read_encoder_average(
         HAL_Delay(FOC_ALIGNMENT_SAMPLE_DELAY_MS);
 
         uint16_t raw_angle;
-        if (as5600_read(self->as5600_handle, &raw_angle) != HAL_OK) {
+        if (as5600_read_blocking(self->as5600_handle, &raw_angle) != HAL_OK) {
             return HAL_ERROR;
         }
 
@@ -415,6 +417,7 @@ static HAL_StatusTypeDef rotor_align(
 
     const float32_t mechanical_angle =
         aligned_raw_angle * FOC_TWO_PI / (float32_t)FOC_ENCODER_CPR;
+    self->magnitude_angle = mechanical_angle;
     const float32_t direction_sign =
         self->rotor_direction == FOC_ROTOR_DIRECTION_SAME ? 1.0f : -1.0f;
     self->rotor_offset = wrap_angle_2pi(
@@ -521,6 +524,7 @@ HAL_StatusTypeDef FOCInitialize(
     self->rotor_direction = FOC_ROTOR_DIRECTION_SAME;
     self->rotor_offset = 0.0f;
     self->electrical_angle = 0.0f;
+    self->magnitude_angle = 0.0f;
     self->pwm_started = 0U;
     self->Target_Uq = 0.0f;
     self->Target_Ud = 0.0f;
@@ -661,20 +665,16 @@ HAL_StatusTypeDef FOC_Update(FOC_HandleTypeDef *self) {
         return HAL_ERROR;
     }
 
-    uint16_t raw_angle;
     float32_t Target_Uq = self->Target_Uq;
     float32_t Target_Ud = self->Target_Ud;
     float32_t Target_Ualpha, Target_Ubeta;
     float32_t duty_a, duty_b, duty_c;
-    if (as5600_read(self->as5600_handle, &raw_angle) != HAL_OK) {
-        driver_shutdown(self, FOC_STATE_FAULT);
-        return HAL_ERROR;
-    }
-    float32_t magnitude_angle = (float32_t) raw_angle * 2 * PI  / 4096.0f;
     const float32_t direction_sign =
         self->rotor_direction == FOC_ROTOR_DIRECTION_SAME ? 1.0f : -1.0f;
+    const float32_t magnitude_angle = self->magnitude_angle;
     float32_t electrical_angle =
-        direction_sign * (float32_t)self->pole_pairs * magnitude_angle + self->rotor_offset;
+        direction_sign * (float32_t)self->pole_pairs * magnitude_angle +
+        self->rotor_offset;
     self->electrical_angle = electrical_angle;
     if (limit_dq_voltage(&Target_Uq, &Target_Ud) != HAL_OK) {
         driver_shutdown(self, FOC_STATE_FAULT);
@@ -773,5 +773,15 @@ HAL_StatusTypeDef FOC_CurrentSample(
     float32_t I_a, I_b;
     clarke(self->current_u, self->current_v, self->current_w, &I_a, &I_b);
     park(self->electrical_angle, I_a, I_b, &self->I_q, &self->I_d);
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef FOC_EncoderCallback(
+    FOC_HandleTypeDef *self,
+    float32_t magnitude_angle) {
+    if (self == NULL || !isfinite(magnitude_angle)) {
+        return HAL_ERROR;
+    }
+    self->magnitude_angle = magnitude_angle;
     return HAL_OK;
 }

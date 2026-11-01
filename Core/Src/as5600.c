@@ -1,7 +1,6 @@
 #include "as5600.h"
 
-#include <stdio.h>
-
+static uint8_t rx_buffer[2];
 
 HAL_StatusTypeDef as5600_init(I2C_HandleTypeDef *hi2c) {
     if (hi2c != NULL) {
@@ -35,7 +34,32 @@ HAL_StatusTypeDef as5600_init(I2C_HandleTypeDef *hi2c) {
     return HAL_ERROR;
 }
 
-HAL_StatusTypeDef as5600_read(I2C_HandleTypeDef *hi2c, uint16_t *raw_angle) {
+HAL_StatusTypeDef as5600_trigger(I2C_HandleTypeDef *hi2c) {
+    if (hi2c == NULL) {
+        return HAL_ERROR;
+    }
+    HAL_StatusTypeDef status = HAL_I2C_Master_Receive_DMA(
+        hi2c,
+        AS5600_ADDR,
+        rx_buffer,
+        sizeof(rx_buffer));
+    return status;
+}
+
+HAL_StatusTypeDef as5600_callback(float32_t *magnitude_angle) {
+    if (magnitude_angle == NULL) {
+        return HAL_ERROR;
+    }
+
+    const uint16_t raw_angle =
+        (((uint16_t)rx_buffer[0] << 8U) | (uint16_t)rx_buffer[1]) & 0x0FFFU;
+    *magnitude_angle = (float32_t)raw_angle * 2.0f * PI / 4096.0f;
+    return HAL_OK;
+}
+
+HAL_StatusTypeDef as5600_read_blocking(
+    I2C_HandleTypeDef *hi2c,
+    uint16_t *raw_angle) {
     if (hi2c != NULL && raw_angle != NULL) {
         uint8_t buffer[2];
         HAL_StatusTypeDef i2c_status = HAL_I2C_Master_Receive(
@@ -47,7 +71,8 @@ HAL_StatusTypeDef as5600_read(I2C_HandleTypeDef *hi2c, uint16_t *raw_angle) {
         if (i2c_status != HAL_OK) {
             return i2c_status;
         }
-        *raw_angle = (buffer[0] << 8 | buffer[1]) & 0x0FFF;
+        *raw_angle =
+            (((uint16_t)buffer[0] << 8U) | (uint16_t)buffer[1]) & 0x0FFFU;
         return HAL_OK;
     }
     return HAL_ERROR;

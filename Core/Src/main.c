@@ -54,6 +54,7 @@ ADC_HandleTypeDef hadc2;
 ADC_HandleTypeDef hadc3;
 
 I2C_HandleTypeDef hi2c1;
+DMA_HandleTypeDef hdma_i2c1_rx;
 
 TIM_HandleTypeDef htim1;
 
@@ -63,6 +64,8 @@ UART_HandleTypeDef huart1;
 FOC_HandleTypeDef foc;
 
 volatile uint8_t foc_update_pending;
+volatile uint8_t encoder_read_pending;
+static uint8_t tim_divide_count;
 
 static arm_pid_instance_f32 current_q_pi;
 static arm_pid_instance_f32 current_d_pi;
@@ -75,6 +78,7 @@ volatile float32_t current_loop_ud;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_I2C1_Init(void);
@@ -192,6 +196,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_TIM1_Init();
   MX_USART1_UART_Init();
   MX_I2C1_Init();
@@ -218,8 +223,14 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     if (foc_update_pending) {
-      FOC_Update(&foc);
       foc_update_pending = 0U;
+      FOC_Update(&foc);
+    }
+
+    if (encoder_read_pending) {
+      if (as5600_trigger(&hi2c1) == HAL_OK) {
+        encoder_read_pending = 0U;
+      }
     }
   }
   /* USER CODE END 3 */
@@ -640,6 +651,22 @@ static void MX_USART1_UART_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -703,11 +730,30 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc) {
   }
 }
 
+void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c) {
+  if (hi2c == NULL || hi2c->Instance != I2C1) {
+    return;
+  }
+
+  float32_t magnitude_angle;
+  if (as5600_callback(&magnitude_angle) == HAL_OK) {
+    (void)FOC_EncoderCallback(&foc, magnitude_angle);
+  }
+}
+
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   if (htim == NULL || htim->Instance != TIM1) {
     return;
   }
+  if (__HAL_TIM_IS_TIM_COUNTING_DOWN(htim)) {
+    return;
+  }
+  ++tim_divide_count;
   foc_update_pending = 1U;
+  if (tim_divide_count >= 4U) {
+    tim_divide_count = 0U;
+    encoder_read_pending = 1U;
+  }
 }
 /* USER CODE END 4 */
 

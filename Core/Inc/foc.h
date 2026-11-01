@@ -36,6 +36,7 @@ typedef struct {
     uint8_t pole_pairs;
     float32_t rotor_offset;
     uint8_t rotor_direction;
+    volatile float32_t magnitude_angle;
     float32_t electrical_angle;
     uint8_t pwm_started;
     volatile FOC_StateTypeDef state;
@@ -83,6 +84,9 @@ HAL_StatusTypeDef FOC_CurrentSample(
     uint32_t raw_u,
     uint32_t raw_v,
     uint32_t raw_w);
+HAL_StatusTypeDef FOC_EncoderCallback(
+    FOC_HandleTypeDef *self,
+    float32_t magnitude_angle);
 
 void inv_park(float32_t arc_angle, float32_t U_q, float32_t U_d, float32_t *U_alpha, float32_t *U_beta);
 void inv_clarke(float32_t U_alpha, float32_t U_beta, float32_t *U_a, float32_t *U_b,
