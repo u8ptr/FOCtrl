@@ -35,12 +35,14 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define MOTOR_POLE_PAIRS 7
-#define CURRENT_LOOP_IQ_REFERENCE_A 0.2f
+#define CURRENT_LOOP_IQ_REFERENCE_A 0.02f
 #define CURRENT_LOOP_ID_REFERENCE_A 0.0f
 #define CURRENT_LOOP_Q_KP 0.1633f
 #define CURRENT_LOOP_Q_KI 0.0231f
 #define CURRENT_LOOP_D_KP 0.1633f
 #define CURRENT_LOOP_D_KI 0.0231f
+#define VELOCITY_BLOCK_SAMPLES 5U
+#define VELOCITY_WINDOW_BLOCKS 10U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -71,8 +73,7 @@ static arm_pid_instance_f32 current_q_pi;
 static arm_pid_instance_f32 current_d_pi;
 static uint8_t current_loop_initialized;
 
-volatile float32_t current_loop_uq;
-volatile float32_t current_loop_ud;
+static float32_t velocity;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -89,6 +90,8 @@ static void MX_ADC3_Init(void);
 static void CurrentLoop_Init(void);
 static void CurrentLoop_Reset(void);
 static void CurrentLoop_Run(void);
+
+static void DWT_Init(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -104,8 +107,6 @@ static void CurrentLoop_Init(void) {
   current_d_pi.Kd = 0.0f;
   arm_pid_init_f32(&current_d_pi, 1);
 
-  current_loop_uq = 0.0f;
-  current_loop_ud = 0.0f;
   current_loop_initialized = 1U;
 }
 
@@ -116,8 +117,6 @@ static void CurrentLoop_Reset(void) {
 
   arm_pid_reset_f32(&current_q_pi);
   arm_pid_reset_f32(&current_d_pi);
-  current_loop_uq = 0.0f;
-  current_loop_ud = 0.0f;
   (void)FOC_SetTarget(&foc, 0.0f, 0.0f);
 }
 
@@ -160,9 +159,15 @@ static void CurrentLoop_Run(void) {
    * into its output state so the integrator cannot continue winding up. */
   current_q_pi.state[2] = uq;
   current_d_pi.state[2] = ud;
-  current_loop_uq = uq;
-  current_loop_ud = ud;
   (void)FOC_SetTarget(&foc, uq, ud);
+}
+
+void DWT_Init(void) {
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+
+  DWT->CYCCNT = 0;
+
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 }
 
 /* USER CODE END 0 */
@@ -203,16 +208,17 @@ int main(void)
   MX_ADC1_Init();
   MX_ADC2_Init();
   MX_ADC3_Init();
+  DWT_Init();
   /* USER CODE BEGIN 2 */
   if (FOCInitialize(&foc, &htim1, &hi2c1, &hadc1, &hadc2, &hadc3, 7, DRV_EN_GPIO_Port, DRV_EN_Pin,
     nFAULT_GPIO_Port, nFAULT_Pin) != HAL_OK) {
     printf("Foc Initialize Failed \r\n");
     Error_Handler();
   }
+  HAL_TIM_Base_Start_IT(&htim1);
   CurrentLoop_Init();
   FOC_SetTarget(&foc, 0.0f, 0.0f);
   FOC_Start(&foc);
-  HAL_TIM_Base_Start_IT(&htim1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -228,8 +234,10 @@ int main(void)
     }
 
     if (encoder_read_pending) {
-      if (as5600_trigger(&hi2c1) == HAL_OK) {
-        encoder_read_pending = 0U;
+      encoder_read_pending = 0U;
+
+      if (as5600_trigger(&hi2c1) != HAL_OK) {
+        encoder_read_pending = 1U;
       }
     }
   }
@@ -736,8 +744,69 @@ void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c) {
   }
 
   float32_t magnitude_angle;
-  if (as5600_callback(&magnitude_angle) == HAL_OK) {
-    (void)FOC_EncoderCallback(&foc, magnitude_angle);
+  static float32_t delta_angle_sum;
+  static float32_t last_angle;
+  static float32_t delta_angle_history[VELOCITY_WINDOW_BLOCKS];
+  static float32_t window_delta_angle;
+  static uint32_t cycle_history[VELOCITY_WINDOW_BLOCKS];
+  static uint32_t window_cycles;
+  static uint32_t cycnt_start;
+  static uint8_t velocity_sample_cnt;
+  static uint8_t window_index;
+  static uint8_t window_count;
+  static uint8_t velocity_initialized;
+  static uint32_t sample_cycles;
+  if (as5600_callback(&magnitude_angle) != HAL_OK) {
+    return;
+  }
+  (void)FOC_EncoderCallback(&foc, magnitude_angle);
+
+  if (!velocity_initialized) {
+    cycnt_start = DWT->CYCCNT;
+    last_angle = magnitude_angle;
+    velocity_sample_cnt = 0;
+    velocity_initialized = 1;
+    return;
+  }
+
+  float32_t delta_angle = magnitude_angle - last_angle;
+  last_angle = magnitude_angle;
+  if (delta_angle > PI) {
+    delta_angle -= 2.0f * PI;
+  } else if (delta_angle < -PI) {
+    delta_angle += 2.0f * PI;
+  }
+
+  delta_angle_sum += delta_angle;
+  velocity_sample_cnt++;
+  if (velocity_sample_cnt >= VELOCITY_BLOCK_SAMPLES) {
+    const uint32_t cycnt_now = DWT->CYCCNT;
+    sample_cycles = cycnt_now - cycnt_start;
+
+    window_delta_angle -= delta_angle_history[window_index];
+    window_cycles -= cycle_history[window_index];
+
+    delta_angle_history[window_index] = delta_angle_sum;
+    cycle_history[window_index] = sample_cycles;
+    window_delta_angle += delta_angle_sum;
+    window_cycles += sample_cycles;
+
+    if (++window_index >= VELOCITY_WINDOW_BLOCKS) {
+      window_index = 0U;
+    }
+    if (window_count < VELOCITY_WINDOW_BLOCKS) {
+      ++window_count;
+    }
+    if (window_count == VELOCITY_WINDOW_BLOCKS) {
+      velocity = window_delta_angle *
+        (float32_t)SystemCoreClock *
+          60.0f /
+          (2.0f * PI * (float32_t)window_cycles);
+    }
+
+    delta_angle_sum = 0.0f;
+    velocity_sample_cnt = 0U;
+    cycnt_start = cycnt_now;
   }
 }
 
